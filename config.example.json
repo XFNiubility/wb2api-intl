@@ -41,7 +41,8 @@
     "passthrough_ip": false
   },
   "features": {
-    "sanitize_blacklist_fingerprints": true
+    "sanitize_blacklist_fingerprints": true,
+    "default_1m_context": true
   },
   "prompt": {
     "mode": "passthrough",
@@ -69,5 +70,11 @@
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m"
+  },
+  "raccoon": {
+    "enabled": true,
+    "account_file": "",
+    "checkin_enabled": true,
+    "checkin_hours": [9]
   }
 }

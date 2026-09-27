@@ -306,6 +306,15 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 
 > Windows 用户请用方式 A（或 WSL）；`login.sh` 需要 python3。
 
+**方式 C：办公小浣熊子网关（`raccoon.enabled=true`，独立于 CodeBuddy 账号）**
+
+面板左侧「办公小浣熊」页或「添加账号 → 办公小浣熊」tab 登录，两种方式：
+
+- **手机号 + 密码直登（推荐）**：填手机号与密码，网关侧对敏感字段做 AES-128-CFB 加密后调上游 `login_with_password`，成功即落号进小浣熊账号池。触发滑块验证码时改用下面的 Token 方式。
+- **Cookie Token 兜底**：在小浣熊官网登录后按 F12 → Application → Cookies，复制 `raccoon_token`（必填）与 `raccoon_refresh_token`（选填，用于自动续期），粘贴到面板即可落号。
+
+小浣熊账号与 CodeBuddy 账号池、上游、凭证完全隔离；子网关走 `/raccoon/v1/*`，每日 9 点自动签到（可配）。CLI 登录见 `cmd/raccoonlogin`。
+
 ### 验证
 
 ```bash
@@ -373,6 +382,10 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
+| `raccoon.enabled` | `true` | 办公小浣熊子网关开关；`true` 时在 `/raccoon/v1/*` 挂载独立反代（账号池 + 上游 xiaohuanxiong.com 与 CodeBuddy 主链路隔离） |
+| `raccoon.account_file` | 空 | 小浣熊账号存储文件；空 = `<auth_dir>/raccoon-accounts.json` |
+| `raccoon.checkin_enabled` | `true` | 小浣熊每日自动签到开关 |
+| `raccoon.checkin_hours` | `[9]` | 小浣熊每日签到整点（本地时区） |
 
 ### 上游超时语义（三段各归其位）
 
@@ -559,6 +572,9 @@ http://127.0.0.1:7863/panel/
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
+| `POST /raccoon/v1/chat/completions` | Bearer（`api_key` 非空时） | **办公小浣熊子网关**补全（`raccoon.enabled=true` 时挂载，独立账号池 + 上游 xiaohuanxiong.com，与 CodeBuddy 主链路完全隔离） |
+| `GET /raccoon/v1/models` | Bearer（`api_key` 非空时） | 小浣熊模型列表（远程目录 10min 缓存，失败回退内置清单） |
+| `GET /raccoon/healthz` | 无 | 小浣熊子网关健康检查（`service=raccoon2api`） |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
 

@@ -105,6 +105,8 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// Default1MContext 支持 1M 的模型默认使用 1M 会话预算；仅影响模型元数据。
+		Default1MContext bool `json:"default_1m_context"`
 	} `json:"features"`
 
 	Prompt struct {
@@ -155,6 +157,15 @@ type Config struct {
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
 
+	// Raccoon 小浣熊子网关（可选）：开启后在 /raccoon/v1/* 挂载独立反代，
+	// 账号池与上游 xiaohuanxiong.com 与 CodeBuddy 主链路完全隔离。
+	Raccoon struct {
+		Enabled        bool   `json:"enabled"`         // 默认 false；true 才挂载子网关
+		AccountFile    string `json:"account_file"`    // 账号存储文件，空 = <auth_dir>/raccoon-accounts.json
+		CheckinHours   []int  `json:"checkin_hours"`   // 每日签到整点，空 = [9]
+		CheckinEnabled bool   `json:"checkin_enabled"` // 每日自动签到开关，缺省 true
+	} `json:"raccoon"`
+
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
@@ -204,6 +215,7 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	c.Features.Default1MContext = true
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
@@ -224,6 +236,10 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// 小浣熊子网关：默认开启（与国内/国际通道一样默认可用）；每日 9 点自动签到。
+	c.Raccoon.Enabled = true
+	c.Raccoon.CheckinEnabled = true
+	c.Raccoon.CheckinHours = []int{9}
 	return c
 }
 
@@ -364,6 +380,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.SanitizeBlacklistFingerprints = b
+		}
+	}
+	if v := os.Getenv("WB2A_DEFAULT_1M_CONTEXT"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.Default1MContext = b
 		}
 	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {

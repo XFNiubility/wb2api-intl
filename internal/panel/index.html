@@ -430,6 +430,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#taskscenter" data-view="taskscenter">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
         任务中心</a></li>
+      <li><a href="#raccoon" data-view="raccoon" id="navRaccoon" hidden>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="6"/><circle cx="6" cy="7" r="1"/><circle cx="10" cy="7" r="1"/><path d="M5.5 10.5c.8.7 1.6 1 2.5 1s1.7-.3 2.5-1"/></svg>
+        办公小浣熊</a></li>
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
@@ -520,6 +523,23 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="d">扫描所有账号的成长任务与开学季待办，把没做的排成一列，一键执行。</div>
         </div>
         <div id="qcList"></div>
+      </div>
+    </section>
+
+    <!-- 小浣熊子网关 -->
+    <section class="view" id="view-raccoon" hidden>
+      <div class="box">
+        <header>
+          <h3>办公小浣熊账号</h3><span class="grow"></span>
+          <span class="note" id="rcMeta">独立子网关 /raccoon/v1</span>
+          <button class="xs" id="btnRcCheckinAll">全部签到</button>
+          <button class="xs" id="btnRcReload">刷新列表</button>
+        </header>
+        <div class="tbl-wrap"><table class="acc">
+          <thead><tr><th>账号</th><th>用户ID</th><th>组织</th><th>可用积分</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="rcBody"></tbody>
+        </table></div>
+        <div class="hint" id="rcEmpty" style="margin-top:10px" hidden>暂无小浣熊账号，点右上「添加账号 → 办公小浣熊」登录。</div>
       </div>
     </section>
 
@@ -794,7 +814,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="savebar">
           <span class="grow"></span>
           <span class="restart-note" id="cfgNote"></span>
-          <button type="button" id="btnCfgReload">放弃修改</button>
+          <button type="button" id="btnCfgDiscard">放弃修改</button>
+          <button type="button" id="btnCfgReload">从磁盘热重载</button>
+          <button type="button" id="btnRestart" class="bad">重启服务</button>
           <button type="submit" class="primary" id="btnCfgSave">保存配置</button>
         </div>
       </form>
@@ -872,6 +894,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="tabs" id="addTabs">
         <button class="tab on" data-tab="login">浏览器登录</button>
         <button class="tab" data-tab="import">导入 JSON</button>
+        <button class="tab" data-tab="raccoon" id="btnSiteRaccoon" hidden>办公小浣熊</button>
       </div>
     </header>
     <div class="body">
@@ -900,6 +923,27 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <input type="file" id="importFile" accept=".json" style="margin-bottom:8px">
         <div id="importDone" class="state ok" hidden></div>
         <div id="importErr" class="state err" hidden></div>
+      </div>
+      <!-- 办公小浣熊登录 -->
+      <div id="addTabRaccoon" class="tab-panel" hidden>
+        <div id="addRaccoon">
+          <div class="state">输入小浣熊账号（手机号 + 密码）直接登录：</div>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <input type="text" id="rcNation" value="86" placeholder="区号" style="width:70px">
+            <input type="text" id="rcPhone" placeholder="手机号" style="flex:1" autocomplete="username">
+          </div>
+          <input type="password" id="rcPwd" placeholder="密码" style="width:100%;margin-top:8px" autocomplete="current-password">
+          <button id="btnRcLogin" class="primary" type="button" style="margin-top:10px">登录并载入账号</button>
+          <div class="hint" style="margin-top:8px">遇到滑块验证码过不去？改用下方 Cookie/Token 方式。</div>
+          <hr style="margin:14px 0;border:none;border-top:1px solid var(--line)">
+          <div class="state">或粘贴浏览器 Cookie 中的 Token（滑块兜底）：</div>
+          <div class="hint" style="margin-top:4px">在小浣熊官网登录后按 F12 → Application → Cookies，复制 <code>raccoon_token</code>（必填）与 <code>raccoon_refresh_token</code>（选填，用于自动续期）。</div>
+          <input type="text" id="rcAccess" placeholder="raccoon_token（access token）" style="width:100%;margin-top:8px">
+          <input type="text" id="rcRefresh" placeholder="raccoon_refresh_token（可选）" style="width:100%;margin-top:8px">
+          <button id="btnRcToken" type="button" style="margin-top:10px">用 Token 载入账号</button>
+          <div id="rcDone" class="state ok" hidden style="margin-top:10px"></div>
+          <div id="rcErr" class="state err" hidden style="margin-top:10px"></div>
+        </div>
       </div>
     </div>
     <footer>

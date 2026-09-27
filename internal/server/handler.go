@@ -62,6 +62,10 @@ type Config struct {
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
+
+	// Raccoon 可选的小浣熊子网关；非 nil 时在 /raccoon/ 前缀下挂载其路由
+	// （独立账号池与上游 xiaohuanxiong.com，与 CodeBuddy 主链路隔离）。
+	Raccoon RaccoonMounter
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -97,6 +101,12 @@ const notFoundCooldown = 60 * time.Second
 // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
 const ServiceName = "workbuddy2api"
 
+// RaccoonMounter 由可选子网关实现（避免 server 直接依赖 raccoon 包，防止 import 环）。
+// internal/raccoon.Gateway 满足该接口。nil 值表示未启用子网关。
+type RaccoonMounter interface {
+	Register(*http.ServeMux)
+}
+
 // Handler 主路由。
 type Handler struct {
 	cfg     Config
@@ -128,6 +138,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
+	}
+	if cfg.Raccoon != nil {
+		// 小浣熊子网关自注册 /raccoon/v1/* 与 /raccoon/healthz（各自鉴权与账号池）。
+		cfg.Raccoon.Register(h.mux)
 	}
 	return h
 }

@@ -126,7 +126,7 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', raccoon: '办公小浣熊', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -138,6 +138,7 @@ function go(v) {
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   if (v === 'taskscenter') reattachQueueView();
+  if (v === 'raccoon') loadRaccoon();
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
@@ -222,6 +223,9 @@ async function loadOverview(quiet) {
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
     $('sSticky').textContent = d.sticky_sessions;
+    // 小浣熊子网关启用时，显隐导航项与「添加账号」弹窗入口。
+    const rc = $('btnSiteRaccoon'); if (rc) rc.hidden = !d.raccoon_enabled;
+    const nrc = $('navRaccoon'); if (nrc) nrc.hidden = !d.raccoon_enabled;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
     $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
@@ -505,7 +509,55 @@ $('btnEye').onclick = () => {
   el.type = show ? 'text' : 'password';
   $('btnEye').textContent = show ? '隐藏' : '显示';
 };
-$('btnCfgReload').onclick = loadConfig;
+$('btnCfgDiscard').onclick = loadConfig;
+function updateSessionKey(r, fallback) {
+  const k = typeof r.api_key === 'string' ? r.api_key : fallback;
+  if (typeof k !== 'string') return;
+  if (k) localStorage.setItem(LS_KEY, k); else localStorage.removeItem(LS_KEY);
+}
+$('btnCfgReload').onclick = async () => {
+  const btn = $('btnCfgReload');
+  btn.disabled = true; btn.textContent = '重载中…';
+  try {
+    const r = await api('config/reload', { method: 'POST' });
+    updateSessionKey(r);
+    const fields = r.restart_required || [];
+    await loadConfig();
+    $('cfgNote').textContent = fields.length ? '待重启：' + fields.join('、') : '配置已热生效';
+    toast(fields.length ? '已热重载；部分启动项待重启' : '已从磁盘热重载并立即生效', 'ok');
+  } catch (e) { toast('热重载失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '从磁盘热重载'; }
+};
+$('btnRestart').onclick = async () => {
+  if (!confirm('确定重启服务？已保存配置将重新加载，正在进行的请求最多等待 5 秒后断开。')) return;
+  const btn = $('btnRestart');
+  btn.disabled = true; btn.textContent = '重启中…';
+  try {
+    const before = await api('overview');
+    await api('restart', { method: 'POST' });
+    $('cfgNote').textContent = '重启已接受，正在等待服务恢复…';
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    let restored = false;
+    for (let i = 0; i < 30; i++) {
+      try {
+        const h = {}; const k = localStorage.getItem(LS_KEY);
+        if (k) h.Authorization = 'Bearer ' + k;
+        const resp = await fetch('/panel/api/overview', { headers: h, cache: 'no-store', signal: AbortSignal.timeout(1500) });
+        if (resp.status === 401) { openKey(); throw new Error('服务已恢复，请输入重新加载后的 API 密钥'); }
+        if (resp.ok) {
+          const d = await resp.json();
+          if (d.uptime_sec != null && before.uptime_sec != null && d.uptime_sec < before.uptime_sec) { restored = true; break; }
+        }
+      } catch (e) { if (e.message.includes('API 密钥')) throw e; }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    if (!restored) throw new Error('恢复等待超时；若修改了监听端口，请访问新地址');
+    await loadConfig(); await loadOverview(true);
+    $('cfgNote').textContent = '服务已重启，配置已重新加载';
+    toast('服务已恢复', 'ok');
+  } catch (e) { $('cfgNote').textContent = e.message; toast('重启状态：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '重启服务'; }
+};
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
   // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。
@@ -541,6 +593,8 @@ function openAdd() {
   $('addLoad').hidden = true; $('addReady').hidden = true;
   $('addDone').hidden = true; $('addErr').hidden = true;
   $('importDone').hidden = true; $('importErr').hidden = true;
+  if ($('rcDone')) $('rcDone').hidden = true;
+  if ($('rcErr')) $('rcErr').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
   stopPoll();
@@ -549,6 +603,11 @@ function switchAddTab(tab) {
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   $('addTabLogin').hidden = tab !== 'login';
   $('addTabImport').hidden = tab !== 'import';
+  const rc = $('addTabRaccoon'); if (rc) rc.hidden = tab !== 'raccoon';
+  // 登录页脚按钮仅在「浏览器登录」标签有意义；小浣熊/导入用各自面板内按钮。
+  $('btnStartLogin').hidden = tab !== 'login';
+  if (tab === 'login') { $('btnStartLogin').disabled = false; }
+  else { $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true; }
 }
 document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
@@ -621,6 +680,98 @@ $('importFile').onchange = async () => {
     $('importErr').textContent = '导入失败：' + e.message;
   }
   $('importFile').value = '';
+};
+
+/* ── 办公小浣熊 ───────────────────────────────────────────────────── */
+$('btnRcLogin').onclick = () => {
+  const phone = $('rcPhone').value.trim();
+  const pwd = $('rcPwd').value;
+  const nation = $('rcNation').value.trim() || '86';
+  if (!phone || !pwd) { toast('请填写手机号和密码', 'err'); return; }
+  $('rcErr').hidden = true; $('rcDone').hidden = true;
+  const btn = $('btnRcLogin'); btn.disabled = true; btn.textContent = '登录中…';
+  api('raccoon/login/password', { method: 'POST', body: JSON.stringify({ phone, password: pwd, nation_code: nation }) }).then(r => {
+    $('rcDone').hidden = false;
+    $('rcDone').textContent = '已添加小浣熊账号 ' + (r.name || r.id) + (r.org_name ? ' · ' + r.org_name : '') + '，已载入子网关';
+    setTimeout(() => { closeAdd(); loadOverview(true); if (view === 'raccoon') loadRaccoon(); }, 1600);
+  }).catch(e => {
+    $('rcErr').hidden = false;
+    $('rcErr').textContent = e.message;
+  }).finally(() => { btn.disabled = false; btn.textContent = '登录并载入账号'; });
+};
+$('btnRcToken').onclick = () => {
+  const at = $('rcAccess').value.trim();
+  const rt = $('rcRefresh').value.trim();
+  if (!at) { toast('请粘贴 raccoon_token', 'err'); return; }
+  $('rcErr').hidden = true; $('rcDone').hidden = true;
+  const btn = $('btnRcToken'); btn.disabled = true; btn.textContent = '载入中…';
+  api('raccoon/login/token', { method: 'POST', body: JSON.stringify({ access_token: at, refresh_token: rt }) }).then(r => {
+    $('rcDone').hidden = false;
+    $('rcDone').textContent = '已添加小浣熊账号 ' + (r.name || r.id) + (r.org_name ? ' · ' + r.org_name : '') + '，已载入子网关';
+    setTimeout(() => { closeAdd(); loadOverview(true); if (view === 'raccoon') loadRaccoon(); }, 1600);
+  }).catch(e => {
+    $('rcErr').hidden = false;
+    $('rcErr').textContent = e.message;
+  }).finally(() => { btn.disabled = false; btn.textContent = '用 Token 载入账号'; });
+};
+async function loadRaccoon() {
+  const tb = $('rcBody');
+  try {
+    const r = await api('raccoon/accounts');
+    const list = r.accounts || [];
+    $('rcEmpty').hidden = list.length > 0;
+    tb.innerHTML = list.map(a =>
+      `<tr data-id="${esc(a.id)}">
+        <td>${esc(a.name || '-')}</td>
+        <td class="num">${esc(a.user_id || '-')}</td>
+        <td>${esc(a.org_name || '-')}</td>
+        <td class="rc-bal">${esc(a.token_tip || '-')}</td>
+        <td>${a.enabled ? '<span class="tag ok">可用</span>' : '<span class="tag mute">停用</span>'}</td>
+        <td class="acts">
+          <button class="xs rc-checkin">签到</button>
+          <button class="xs rc-bal-btn">查积分</button>
+          <button class="xs danger rc-remove">移除</button>
+        </td>
+      </tr>`).join('');
+    bindRaccoonRows();
+  } catch (e) {
+    tb.innerHTML = `<tr><td colspan="6"><div class="empty">${esc(e.message)}</div></td></tr>`;
+  }
+}
+function bindRaccoonRows() {
+  document.querySelectorAll('#rcBody tr[data-id]').forEach(tr => {
+    const id = tr.dataset.id;
+    tr.querySelector('.rc-checkin').onclick = async ev => {
+      const b = ev.target; b.disabled = true; b.textContent = '签到中…';
+      try { const r = await api('raccoon/accounts/' + encodeURIComponent(id) + '/checkin', { method: 'POST' }); toast(r.message || (r.ok ? '已签到' : '未签到'), r.ok ? 'ok' : 'err'); }
+      catch (e) { toast(e.message, 'err'); }
+      finally { b.disabled = false; b.textContent = '签到'; }
+    };
+    tr.querySelector('.rc-bal-btn').onclick = async ev => {
+      const b = ev.target; b.disabled = true;
+      try {
+        const r = await api('raccoon/accounts/' + encodeURIComponent(id) + '/balance');
+        const bal = r.balance || {};
+        tr.querySelector('.rc-bal').textContent = (bal.available ?? 0) + (bal.daily ? ' (日 ' + bal.daily + ')' : '');
+      } catch (e) { toast(e.message, 'err'); }
+      finally { b.disabled = false; }
+    };
+    tr.querySelector('.rc-remove').onclick = async () => {
+      if (!confirm('确定移除该小浣熊账号？')) return;
+      try { await api('raccoon/accounts/' + encodeURIComponent(id) + '/remove', { method: 'POST' }); loadRaccoon(); }
+      catch (e) { toast(e.message, 'err'); }
+    };
+  });
+}
+$('btnRcReload').onclick = loadRaccoon;
+$('btnRcCheckinAll').onclick = async () => {
+  const b = $('btnRcCheckinAll'); b.disabled = true; b.textContent = '签到中…';
+  try {
+    const r = await api('raccoon/checkin_all', { method: 'POST' });
+    const ok = (r.reports || []).filter(x => x.ok).length;
+    toast('已签到 ' + ok + '/' + (r.reports || []).length + ' 个账号', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; b.textContent = '全部签到'; }
 };
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */

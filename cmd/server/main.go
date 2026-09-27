@@ -3,10 +3,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
-	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -21,6 +19,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/raccoon"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
@@ -47,6 +46,13 @@ func stateSibling(stateFile, name string) string {
 }
 
 func main() {
+	maybeRunSupervisor()
+	if runService() {
+		os.Exit(restartExitCode)
+	}
+}
+
+func runService() bool {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
 
@@ -230,6 +236,32 @@ func main() {
 	defer rec.Stop()
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	restartControl := newRestartController(*cfgPath, stop)
+	runtimeMgr := newRuntimeConfigManager(*cfgPath, cfg, live, p, up, sch)
+
+	// 小浣熊子网关（可选）：独立账号存储 + provider，与 CodeBuddy 主链路隔离。
+	// 先于 panel 构建，以便把登录钩子注入面板「添加账号」。
+	var raccoonGW *raccoon.Gateway
+	var raccoonLogin panel.RaccoonLogin
+	if cfg.Raccoon.Enabled {
+		accFile := cfg.Raccoon.AccountFile
+		if accFile == "" {
+			accFile = filepath.Join(cfg.AuthDir, "raccoon-accounts.json")
+		}
+		rStore := raccoon.NewStore(accFile)
+		raccoonGW = raccoon.NewGateway(raccoon.NewProvider(), rStore, func() string { return live.Load().APIKey })
+		raccoonLogin = raccoonPanelAdapter{gw: raccoonGW}
+		log.Printf("小浣熊子网关已启用：/raccoon/v1/*（账号文件 %s，已加载 %d 个账号）", accFile, len(rStore.List()))
+		if cfg.Raccoon.CheckinEnabled {
+			stopCheckin := raccoonGW.StartDailyCheckin(cfg.Raccoon.CheckinHours)
+			defer stopCheckin()
+		} else {
+			log.Printf("小浣熊每日自动签到已禁用（raccoon.checkin_enabled=false）")
+		}
+	}
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -243,20 +275,25 @@ func main() {
 		Live:        live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
-		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
-		ConfigPath: *cfgPath,
-		LoadConfig: func() (any, error) {
-			return Load(*cfgPath)
-		},
-		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
-		},
+		ProbeFile:    stateSibling(cfg.StateFile, "output_probes.json"),
+		ConfigPath:   *cfgPath,
+		LoadConfig:   func() (any, error) { return Load(*cfgPath) },
+		SaveConfig:   runtimeMgr.Save,
+		ReloadConfig: runtimeMgr.Reload,
+		Restart:      restartControl.Request,
+		Raccoon:      raccoonLogin,
 	})
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
 	sch.SetGrowthHook(pn.RunGrowthQueueOnce)
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
+
+	// server 侧 RaccoonMounter：nil 接口在未启用时保持 nil。
+	var raccoonMount server.RaccoonMounter
+	if raccoonGW != nil {
+		raccoonMount = raccoonGW
+	}
 
 	h := server.NewHandler(server.Config{
 		Pool:         p,
@@ -273,10 +310,9 @@ func main() {
 		PromptText:   cfg.PromptText,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		Raccoon:       raccoonMount,
 	})
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 
@@ -293,19 +329,24 @@ func main() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
-		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		_ = shutdownHTTP(srv)
+		p.Flush()
 	}()
 
 	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		stop()
+		<-shutdownDone
 		log.Fatalf("http: %v", err)
 	}
+	stop()
+	<-shutdownDone
 	log.Printf("bye")
+	return restartControl.Pending()
 }
 
 // panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL
@@ -319,147 +360,7 @@ func panelListenPath(listen string) string {
 	return listen
 }
 
-// saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。
-//
-// 热生效范围（设计取舍）：
-//   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
-//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval
-//   - schedule.* → scheduler.Reconfigure/SetBalanceInterval
-//
-// 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
-//   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
-//
-// 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
-// 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
-// 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
+// saveConfig 保留旧签名兼容点：实际实现委托给 config_runtime.go 的事务化保存。
 func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
-	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
-	oldRaw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read current config: %w", err)
-	}
-	var cur, incoming map[string]any
-	if err := json.Unmarshal(oldRaw, &cur); err != nil {
-		cur = map[string]any{}
-	}
-	if err := json.Unmarshal(raw, &incoming); err != nil {
-		return nil, fmt.Errorf("parse submitted config: %w", err)
-	}
-	merged := mergeConfigMaps(cur, incoming)
-
-	// 2) 校验（与启动同一套 Default+normalize），失败直接返回、不落盘。
-	newCfg, err := ParseConfig(mergedJSON(merged))
-	if err != nil {
-		return nil, err
-	}
-
-	// 3) 落盘（原子替换）。
-	out, err := json.MarshalIndent(merged, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("marshal config: %w", err)
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return nil, fmt.Errorf("write config: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		// A single-file Docker bind mount cannot be renamed over its mount
-		// target (Linux returns EBUSY / "device or resource busy"). Keep the
-		// atomic path for regular files, but update the mounted file in place
-		// for this specific deployment shape.
-		if !errors.Is(err, syscall.EBUSY) {
-			return nil, fmt.Errorf("replace config: %w", err)
-		}
-		f, openErr := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
-		if openErr != nil {
-			_ = os.Remove(tmp)
-			return nil, fmt.Errorf("replace config (bind mount fallback): %w", openErr)
-		}
-		_, writeErr := f.Write(out)
-		if writeErr == nil {
-			writeErr = f.Sync()
-		}
-		closeErr := f.Close()
-		// 写失败时保留 tmp（挂载文件已被 O_TRUNC 破坏，tmp 里是完整新内容，
-		// 可手工恢复）；写成功才清理。
-		if writeErr != nil {
-			return nil, fmt.Errorf("replace config (bind mount fallback, 完整新内容保留在 %s): %w", tmp, writeErr)
-		}
-		_ = os.Remove(tmp)
-		if closeErr != nil {
-			return nil, fmt.Errorf("replace config (bind mount fallback): %w", closeErr)
-		}
-	}
-
-	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
-	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
-		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
-	})
-	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
-	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
-	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
-	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
-	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
-	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
-	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
-	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
-	sch.Reconfigure(
-		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
-		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
-		newCfg.Schedule.GrowthHours,
-		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
-		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled,
-		!newCfg.Schedule.GrowthEnabled)
-	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
-
-	return restartRequiredFields(newCfg), nil
-}
-
-// restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
-// 恒返回完整清单中的"与当前进程装配期依赖相关"的项——面板据此提示用户。
-func restartRequiredFields(c *Config) []string {
-	var out []string
-	// 这些字段在进程内被监听地址/HTTP client/目录句柄等装配期对象捕获。
-	if c.Listen != "" {
-		out = append(out, "listen")
-	}
-	if c.AuthDir != "" {
-		out = append(out, "auth_dir")
-	}
-	if c.StateFile != "" {
-		out = append(out, "state_file")
-	}
-	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
-	if c.Upstash.URL != "" || c.Upstash.Token != "" {
-		out = append(out, "upstash")
-	}
-	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
-	return out
-}
-
-// mergeConfigMaps 把 incoming 深合并进 cur（原地），返回 cur。
-// 对嵌套对象逐键覆盖而不是整体替换：面板表单只提交它管理的键，
-// 未提交的兄弟键（含用户手写的未知键）保持原样。
-func mergeConfigMaps(cur, incoming map[string]any) map[string]any {
-	for k, v := range incoming {
-		if inMap, ok := v.(map[string]any); ok {
-			if curMap, ok := cur[k].(map[string]any); ok {
-				cur[k] = mergeConfigMaps(curMap, inMap)
-				continue
-			}
-		}
-		cur[k] = v
-	}
-	return cur
-}
-
-// mergedJSON 把合并后的 map 序列化回 JSON（供 ParseConfig 校验）。
-func mergedJSON(m map[string]any) []byte {
-	b, err := json.Marshal(m)
-	if err != nil {
-		return []byte("{}")
-	}
-	return b
+	return saveConfigCompat(raw, path, live, p, up, sch)
 }

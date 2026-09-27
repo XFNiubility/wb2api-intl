@@ -11,6 +11,7 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -42,6 +43,15 @@ type Config struct {
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
 
+	// ReloadConfig 从磁盘读取（含环境变量覆盖）并热应用配置。
+	ReloadConfig func() (restartRequired []string, err error)
+	// Restart 请求服务生命周期重建；实现必须串行去重。
+	Restart func() error
+
+	// Raccoon 可选的小浣熊子网关登录钩子；非 nil 时面板「添加账号」多一个小浣熊入口。
+	// 用接口而非具体类型，避免 panel 直接依赖 raccoon 包。
+	Raccoon RaccoonLogin
+
 	// ConfigPath config.json 路径与加载器（配置页读写用）。
 	// LoadConfig 返回解析后的配置对象（前端展示/校验用，具体类型由 main 注入的闭包决定）；
 	// nil 时配置页返回 501。
@@ -61,6 +71,35 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+}
+
+// RaccoonLogin 小浣熊子网关向面板暴露的登录/运维能力（由 raccoon.Gateway 实现）。
+type RaccoonLogin interface {
+	LoginWithPassword(ctx context.Context, nationCode, phone, password string) (RaccoonAccountView, error)
+	LoginWithToken(accessToken, refreshToken string) (RaccoonAccountView, error)
+	AccountsView() []RaccoonAccountView
+	RemoveAccount(id string) error
+	CheckinOneView(ctx context.Context, id string) (ok bool, message string, err error)
+	CheckinAllView(ctx context.Context) []RaccoonCheckinView
+	BalanceView(ctx context.Context, id string) (map[string]int64, error)
+}
+
+// RaccoonCheckinView 面板展示用的批量签到结果项。
+type RaccoonCheckinView struct {
+	AccountID string `json:"account_id"`
+	Name      string `json:"name"`
+	OK        bool   `json:"ok"`
+	Message   string `json:"message"`
+}
+
+// RaccoonAccountView 面板展示用的小浣熊账号脱敏视图。
+type RaccoonAccountView struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	UserID   string `json:"user_id"`
+	OrgName  string `json:"org_name"`
+	Enabled  bool   `json:"enabled"`
+	TokenTip string `json:"token_tip"`
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -178,6 +217,16 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("POST /panel/api/config/reload", p.withAuth(p.reloadConfig))
+	p.mux.HandleFunc("POST /panel/api/restart", p.withAuth(p.restart))
+	// 小浣熊子网关登录/运维（仅在注入 Raccoon 时可用；否则各 handler 返回 501）。
+	p.mux.HandleFunc("POST /panel/api/raccoon/login/password", p.withAuth(p.raccoonLoginPassword))
+	p.mux.HandleFunc("POST /panel/api/raccoon/login/token", p.withAuth(p.raccoonLoginToken))
+	p.mux.HandleFunc("GET /panel/api/raccoon/accounts", p.withAuth(p.raccoonAccounts))
+	p.mux.HandleFunc("POST /panel/api/raccoon/accounts/{id}/remove", p.withAuth(p.raccoonAccountRemove))
+	p.mux.HandleFunc("POST /panel/api/raccoon/accounts/{id}/checkin", p.withAuth(p.raccoonAccountCheckin))
+	p.mux.HandleFunc("GET /panel/api/raccoon/accounts/{id}/balance", p.withAuth(p.raccoonAccountBalance))
+	p.mux.HandleFunc("POST /panel/api/raccoon/checkin_all", p.withAuth(p.raccoonCheckinAll))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -230,6 +279,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"cooling":         cooling,
 		"disabled":        disabled,
 		"in_flight_full":  inFlightFull,
+		"raccoon_enabled": p.cfg.Raccoon != nil,
 		"accounts":        p.cfg.Pool.List(),
 	})
 }
