@@ -154,6 +154,19 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "读取请求体失败: "+err.Error(), "invalid_request")
 		return
 	}
+	g.serveChat(w, r, body, "")
+}
+
+// ChatForGateway 供主网关（/v1，raccoon: 前缀分域）复用：body 已读入，displayModel
+// 为客户端原始 model 名（带 raccoon: 前缀，用于回写响应的 model 字段）；body 内的
+// model 应已被主网关剥成裸名（上游认的模型 id）。
+func (g *Gateway) ChatForGateway(w http.ResponseWriter, r *http.Request, body []byte, displayModel string) {
+	g.serveChat(w, r, body, displayModel)
+}
+
+// serveChat 小浣熊补全核心：账号轮换 + 冷却 + token 刷新 + 流式/聚合转发。
+// displayOverride 非空时用它回写响应 model（主网关入口传客户端原始前缀名）。
+func (g *Gateway) serveChat(w http.ResponseWriter, r *http.Request, body []byte, displayOverride string) {
 	var req map[string]any
 	if json.Unmarshal(body, &req) != nil {
 		writeError(w, http.StatusBadRequest, "请求体不是有效 JSON", "invalid_request")
@@ -175,6 +188,12 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request) {
 	// 出站强制 stream:true（对齐 APK：本地按需聚合为非流式）。
 	req["stream"] = true
 	outBody, _ := json.Marshal(req)
+	// 回写响应 model 用的展示名：主网关入口传客户端原始前缀名（raccoon:xxx），
+	// 直连子网关时用请求里的 model 原值。
+	displayModel := requestedModel
+	if displayOverride != "" {
+		displayModel = displayOverride
+	}
 
 	var lastErr *UpstreamError
 	for _, acct := range g.candidates() {
@@ -198,7 +217,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request) {
 				// 强制刷新一次后重试同账号。
 				log.Printf("raccoon chat uid=%s: 401, force refresh & retry", shortID(acct.ID))
 				if g.refreshAccount(r.Context(), acct, true) != "" {
-					if retryed := g.retrySingle(r.Context(), acct, outBody, requestedModel, stream, w); retryed {
+					if retryed := g.retrySingle(r.Context(), acct, outBody, displayModel, stream, w); retryed {
 						return
 					}
 				}
@@ -215,18 +234,18 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request) {
 		// 命中：转发。
 		log.Printf("raccoon chat uid=%s: 命中，开始转发", shortID(acct.ID))
 		if stream {
-			_ = upstream.Stream(w, newModelRewriter(resp.Body, requestedModel))
+			_ = upstream.Stream(w, newModelRewriter(resp.Body, displayModel))
 			resp.Body.Close()
 			return
 		}
-		agg, aerr := upstream.Aggregate(newModelRewriter(resp.Body, requestedModel))
+		agg, aerr := upstream.Aggregate(newModelRewriter(resp.Body, displayModel))
 		resp.Body.Close()
 		if aerr != nil {
 			writeError(w, http.StatusBadGateway, "读取上游流失败: "+aerr.Error(), "upstream_parse")
 			return
 		}
 		if _, ok := agg["model"]; ok {
-			agg["model"] = requestedModel
+			agg["model"] = displayModel
 		}
 		writeJSON(w, http.StatusOK, agg)
 		return
@@ -374,4 +393,61 @@ func shortID(id string) string {
 		return id
 	}
 	return id[:8]
+}
+
+// CatalogModelIDs 返回当前小浣熊可见模型的 id 集合（远程目录优先，回退内置清单）。
+// 供主网关 /v1/models 追加 raccoon: 前缀条目、以及 chat 路由判定归属。
+func (g *Gateway) CatalogModelIDs(ctx context.Context) []string {
+	g.ensureCatalogFresh(ctx)
+	g.catMu.Lock()
+	list := g.catalog
+	g.catMu.Unlock()
+	if len(list) == 0 {
+		list = FallbackModels()
+	}
+	out := make([]string, 0, len(list))
+	for _, m := range list {
+		if m.Visible {
+			out = append(out, m.ID)
+		}
+	}
+	return out
+}
+
+// CatalogEntries 返回当前小浣熊可见模型的 OpenAI 形态条目（id 已加 raccoon: 前缀）。
+// 供主网关 /v1/models 合并输出（与直连 /raccoon/v1/models 同源）。
+func (g *Gateway) CatalogEntries(ctx context.Context) []map[string]any {
+	g.ensureCatalogFresh(ctx)
+	g.catMu.Lock()
+	list := g.catalog
+	g.catMu.Unlock()
+	if len(list) == 0 {
+		list = FallbackModels()
+	}
+	out := make([]map[string]any, 0, len(list))
+	for _, m := range list {
+		if !m.Visible {
+			continue
+		}
+		e := m.ToOpenAI("raccoon")
+		e["id"] = "raccoon:" + m.ID
+		out = append(out, e)
+	}
+	return out
+}
+
+// HasModel 判定裸模型 id 是否属于小浣熊（远程目录或内置清单里可见）。
+func (g *Gateway) HasModel(id string) bool {
+	g.catMu.Lock()
+	list := g.catalog
+	g.catMu.Unlock()
+	if len(list) == 0 {
+		list = FallbackModels()
+	}
+	for _, m := range list {
+		if m.ID == id && m.Visible {
+			return true
+		}
+	}
+	return false
 }

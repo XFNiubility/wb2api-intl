@@ -341,6 +341,12 @@ curl -sN http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"global:deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+# 办公小浣熊（model 名加 raccoon: 前缀 → 走小浣熊子网关；raccoon.enabled=true 时可用）
+curl -sN http://localhost:7863/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"raccoon:raccoon-8c4485","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
 ## 配置说明
@@ -578,13 +584,20 @@ http://127.0.0.1:7863/panel/
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时）。**国内模型输出裸名 / `cn:` 前缀，国际模型输出 `global:` 前缀**（`global.enabled=true` 时才列出） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
-| `POST /raccoon/v1/chat/completions` | Bearer（`api_key` 非空时） | **办公小浣熊子网关**补全（`raccoon.enabled=true` 时挂载，独立账号池 + 上游 xiaohuanxiong.com，与 CodeBuddy 主链路完全隔离） |
-| `GET /raccoon/v1/models` | Bearer（`api_key` 非空时） | 小浣熊模型列表（远程目录 10min 缓存，失败回退内置清单） |
+| `POST /v1/chat/completions`（`raccoon:` 前缀模型） | Bearer（`api_key` 非空时） | model 名带 `raccoon:` 前缀时路由到**办公小浣熊子网关**（独立账号池 + 上游 xiaohuanxiong.com） |
+| `POST /raccoon/v1/chat/completions` | Bearer（`api_key` 非空时） | 小浣熊补全的直连端点（与主 `/v1` 的 `raccoon:` 前缀等价，向后兼容保留） |
+| `GET /raccoon/v1/models` | Bearer（`api_key` 非空时） | 小浣熊模型列表直连端点（同样并入 `/v1/models`，带 `raccoon:` 前缀） |
 | `GET /raccoon/healthz` | 无 | 小浣熊子网关健康检查（`service=raccoon2api`） |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
 
-> **国内 / 国际路由**：统一走 `/v1/chat/completions` 与 `/v1/models`，**不分 URL 路径**——由**模型名前缀**选择域（realm）。裸名或 `cn:` 前缀（如 `deepseek-v4-flash`、`cn:glm-5.2`）走**国内域**，`global:` 前缀走**国际域**。选号按域严格隔离：国际模型只用国际账号、国内模型只用国内账号，**跨域不回退**（同域无可用账号直接 503）。国际域名单仅在 `global.enabled=true` 时列出与可用（默认开启）。OpenAI SDK 的 `base_url` 统一填 `http://服务器:7863/v1`，靠 `model` 字段前缀区分国内 / 国际。
+> **三通道统一路由**：`/v1/chat/completions` 与 `/v1/models` 一套端点，由**模型名前缀**选择通道，**不分 URL 路径**：
+> - 裸名或 `cn:` 前缀（如 `deepseek-v4-flash`、`cn:glm-5.2`）→ **CodeBuddy 国内域**
+> - `global:` 前缀 → **CodeBuddy 国际域**（`global.enabled=true` 时才列出/可用，默认开启）
+> - `raccoon:` 前缀（如 `raccoon:raccoon-8c4485`）→ **办公小浣熊子网关**（`raccoon.enabled=true`，独立账号池 + 上游 xiaohuanxiong.com）
+>
+> 各通道账号严格隔离、跨通道不回退（同通道无可用账号直接 503）。`GET /v1/models` 一次列全三通道模型（各带对应前缀）。OpenAI SDK 的 `base_url` 统一填 `http://服务器:7863/v1`，靠 `model` 前缀区分。小浣熊亦保留 `/raccoon/v1/*` 直连端点（向后兼容）。
+
 `/healthz` 响应示例（200 / 503 同结构，仅状态码与计数变化）：
 
 ```json

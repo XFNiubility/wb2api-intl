@@ -105,6 +105,12 @@ const ServiceName = "workbuddy2api"
 // internal/raccoon.Gateway 满足该接口。nil 值表示未启用子网关。
 type RaccoonMounter interface {
 	Register(*http.ServeMux)
+	// CatalogEntries 返回小浣熊模型的 OpenAI 条目（id 已加 raccoon: 前缀），供 /v1/models 合并。
+	CatalogEntries(ctx context.Context) []map[string]any
+	// HasModel 判定裸模型 id 是否属于小浣熊（用于 /v1/chat/completions 的 raccoon: 前缀路由）。
+	HasModel(id string) bool
+	// ChatForGateway 处理一次小浣熊补全：body 内 model 已剥成裸名，displayModel 为回写用的原始前缀名。
+	ChatForGateway(w http.ResponseWriter, r *http.Request, body []byte, displayModel string)
 }
 
 // Handler 主路由。
@@ -251,9 +257,14 @@ const (
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	data := h.modelList()
+	// 合并小浣熊模型（raccoon: 前缀），使 /v1/models 一次列全三通道。
+	if h.cfg.Raccoon != nil {
+		data = append(data, h.cfg.Raccoon.CatalogEntries(r.Context())...)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   data,
 	})
 }
 
@@ -498,6 +509,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &peek)
+
+	// raccoon: 前缀 → 路由到小浣熊子网关（剥前缀后 body 用裸名，回写响应用原始前缀名）。
+	if h.cfg.Raccoon != nil {
+		if bare, ok := strings.CutPrefix(peek.Model, "raccoon:"); ok {
+			outBody := rewriteModel(body, bare)
+			h.cfg.Raccoon.ChatForGateway(w, r, outBody, peek.Model)
+			return
+		}
+	}
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
