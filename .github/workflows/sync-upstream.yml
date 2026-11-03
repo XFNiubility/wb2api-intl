@@ -1,0 +1,32 @@
+name: Auto Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get upstream repo
+        id: upstream
+        run: |
+          UPSTREAM=$(curl -s https://api.github.com/repos/${{ github.repository }} | jq -r '.parent.full_name')
+          echo "upstream=$UPSTREAM" >> "$GITHUB_OUTPUT"
+
+      - name: Sync with upstream
+        run: |
+          git remote add upstream "https://github.com/${{ steps.upstream.outputs.upstream }}.git" 2>/dev/null || git remote set-url upstream "https://github.com/${{ steps.upstream.outputs.upstream }}.git"
+          git fetch upstream
+          git checkout ${{ github.ref_name }}
+          git merge upstream/HEAD --no-edit
+          git push origin ${{ github.ref_name }}
