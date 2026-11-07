@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -31,14 +35,35 @@ jobs:
             const upstream = `${parent.owner.login}/${parent.name}`;
             const branch = parent.default_branch;
             const runGit = require('child_process').execSync;
+            const opt = { stdio: 'inherit' };
+            const quiet = { stdio: 'pipe' };
 
-            runGit(`git remote add upstream https://github.com/${upstream}.git`, { stdio: 'inherit' });
-            runGit(`git fetch upstream ${branch}`, { stdio: 'inherit' });
+            runGit('git config user.name "github-actions[bot]"', quiet);
+            runGit('git config user.email "41898282+github-actions[bot]@users.noreply.github.com"', quiet);
+
+            runGit(`git remote add upstream https://github.com/${upstream}.git`, quiet);
+            runGit(`git fetch upstream ${branch}`, opt);
+
             const behind = runGit(`git rev-list --count HEAD..upstream/${branch}`).toString().trim();
             if (behind === '0') {
-              console.log(`Upstream ${upstream} has no new commits, skip sync. No changes pushed.`);
+              console.log(`Upstream ${upstream} has no new commits. Nothing to do.`);
               return;
             }
-            runGit(`git merge upstream/${branch} --no-edit`, { stdio: 'inherit' });
-            runGit(`git push origin ${branch}`, { stdio: 'inherit' });
-            console.log(`Synced ${behind} new commits from ${upstream}.`);
+            console.log(`Behind upstream by ${behind} commit(s), trying to sync...`);
+
+            try {
+              runGit(`git merge upstream/${branch} --no-edit`, opt);
+            } catch (e) {
+              try { runGit('git merge --abort', quiet); } catch (_) {}
+              console.log(`SKIPPED: this fork has diverged from ${upstream}/${branch} and the merge conflicts.`);
+              console.log('Left untouched on purpose - no changes were pushed. Resolve manually if needed.');
+              return;
+            }
+
+            try {
+              runGit(`git push origin HEAD:${branch}`, opt);
+            } catch (e) {
+              console.log('SKIPPED: merge succeeded locally but push was rejected (branch protection or diverged remote).');
+              return;
+            }
+            console.log(`Done: synced ${behind} new commit(s) from ${upstream}.`);
