@@ -2,6 +2,7 @@ name: Auto Sync Upstream
 
 on:
   schedule:
+    # 每天 08:00 UTC（北京时间 16:00）
     - cron: '0 8 * * *'
   workflow_dispatch:
 
@@ -29,15 +30,15 @@ jobs:
             }
             const upstream = `${parent.owner.login}/${parent.name}`;
             const branch = parent.default_branch;
-            const exec = require('child_process').execSync;
+            const runGit = require('child_process').execSync;
 
-            exec(`git remote add upstream https://github.com/${upstream}.git`, { stdio: 'inherit' });
-            exec(`git fetch upstream ${branch}`, { stdio: 'inherit' });
-            const behind = exec(`git rev-list --count HEAD..upstream/${branch}`).toString().trim();
+            runGit(`git remote add upstream https://github.com/${upstream}.git`, { stdio: 'inherit' });
+            runGit(`git fetch upstream ${branch}`, { stdio: 'inherit' });
+            const behind = runGit(`git rev-list --count HEAD..upstream/${branch}`).toString().trim();
             if (behind === '0') {
               console.log(`Upstream ${upstream} has no new commits, skip sync. No changes pushed.`);
               return;
             }
-            exec(`git merge upstream/${branch} --no-edit`, { stdio: 'inherit' });
-            exec(`git push origin ${branch}`, { stdio: 'inherit' });
+            runGit(`git merge upstream/${branch} --no-edit`, { stdio: 'inherit' });
+            runGit(`git push origin ${branch}`, { stdio: 'inherit' });
             console.log(`Synced ${behind} new commits from ${upstream}.`);
